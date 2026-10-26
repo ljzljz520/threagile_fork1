@@ -40,6 +40,10 @@ func (*SeedRiskTrackingMacro) GetFinalChangeImpact(_ *input.Model, _ *types.Mode
 }
 
 func (*SeedRiskTrackingMacro) Execute(modelInput *input.Model, parsedModel *types.Model) (message string, validResult bool, err error) {
+	// IsRiskTracked uses the shared effective risk tracking resolved during model
+	// analysis, so risks covered by exact declarations or winning wildcard patterns
+	// are not seeded again. Only the model input is extended here: the declared
+	// risk tracking entries (including wildcard patterns) stay untouched.
 	syntheticRiskIDsToCreateTrackingFor := make([]string, 0)
 	for id, risk := range parsedModel.GeneratedRisksBySyntheticId {
 		if !parsedModel.IsRiskTracked(risk) {

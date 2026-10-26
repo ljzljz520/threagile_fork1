@@ -6,7 +6,6 @@ package types
 
 import (
 	"fmt"
-	"regexp"
 	"slices"
 	"sort"
 	"strings"
@@ -54,6 +53,13 @@ type Model struct {
 	DirectContainingTrustBoundaryMappedByTechnicalAssetId map[string]*TrustBoundary       `json:"direct_containing_trust_boundary_mapped_by_technical_asset_id,omitempty" yaml:"direct_containing_trust_boundary_mapped_by_technical_asset_id,omitempty"`
 	GeneratedRisksByCategory                              map[string][]*Risk              `json:"generated_risks_by_category,omitempty" yaml:"generated_risks_by_category,omitempty"`
 	GeneratedRisksBySyntheticId                           map[string]*Risk                `json:"generated_risks_by_synthetic_id,omitempty" yaml:"generated_risks_by_synthetic_id,omitempty"`
+
+	// effectiveRiskTracking is the resolved concrete risk id -> tracking derived from
+	// RiskTracking during model analysis (exact declarations plus the winning wildcard
+	// expansions). It is derived state that is never serialized; RiskTracking always
+	// keeps the declarations as written by the user. Reports and model macros share
+	// this resolved view.
+	effectiveRiskTracking map[string]*RiskTracking `json:"-" yaml:"-"`
 }
 
 type ProgressReporter interface {
@@ -71,24 +77,6 @@ func (model *Model) AddToListOfSupportedTags(tags []string) {
 	}
 }
 
-func (model *Model) GetDeferredRiskTrackingDueToWildcardMatching() map[string]*RiskTracking {
-	deferredRiskTrackingDueToWildcardMatching := make(map[string]*RiskTracking)
-	for syntheticRiskId, riskTracking := range model.RiskTracking {
-		if strings.Contains(syntheticRiskId, "*") { // contains a wildcard char
-			deferredRiskTrackingDueToWildcardMatching[syntheticRiskId] = riskTracking
-		}
-	}
-
-	return deferredRiskTrackingDueToWildcardMatching
-}
-
-func (model *Model) HasNotYetAnyDirectNonWildcardRiskTracking(syntheticRiskId string) bool {
-	if _, ok := model.RiskTracking[syntheticRiskId]; ok {
-		return false
-	}
-	return true
-}
-
 func (model *Model) CheckTags(tags []string, where string) ([]string, error) {
 	var tagsUsed = make([]string, 0)
 	if tags != nil {
@@ -103,72 +91,6 @@ func (model *Model) CheckTags(tags []string, where string) ([]string, error) {
 		}
 	}
 	return tagsUsed, nil
-}
-
-func (model *Model) ApplyWildcardRiskTrackingEvaluation(ignoreOrphanedRiskTracking bool, progressReporter ProgressReporter) error {
-	progressReporter.Info("Executing risk tracking evaluation")
-	for syntheticRiskIdPattern, riskTracking := range model.GetDeferredRiskTrackingDueToWildcardMatching() {
-		progressReporter.Infof("Applying wildcard risk tracking for risk id: %v", syntheticRiskIdPattern)
-
-		foundSome := false
-		var matchingRiskIdExpression = regexp.MustCompile(strings.ReplaceAll(regexp.QuoteMeta(syntheticRiskIdPattern), `\*`, `[^@]+`))
-		for syntheticRiskId := range model.GeneratedRisksBySyntheticId {
-			if matchingRiskIdExpression.Match([]byte(syntheticRiskId)) && model.HasNotYetAnyDirectNonWildcardRiskTracking(syntheticRiskId) {
-				foundSome = true
-				model.RiskTracking[syntheticRiskId] = &RiskTracking{
-					SyntheticRiskId: strings.TrimSpace(syntheticRiskId),
-					Justification:   riskTracking.Justification,
-					CheckedBy:       riskTracking.CheckedBy,
-					Ticket:          riskTracking.Ticket,
-					Status:          riskTracking.Status,
-					Date:            riskTracking.Date,
-				}
-
-				progressReporter.Infof("  => %v", syntheticRiskId)
-			}
-		}
-
-		if !foundSome {
-			if ignoreOrphanedRiskTracking {
-				progressReporter.Warnf("Wildcard risk tracking does not match any risk id: %v", syntheticRiskIdPattern)
-			} else {
-				return fmt.Errorf("wildcard risk tracking does not match any risk id: %v", syntheticRiskIdPattern)
-			}
-		}
-	}
-	return nil
-}
-
-func (model *Model) CheckRiskTracking(ignoreOrphanedRiskTracking bool, progressReporter ProgressReporter) error {
-	progressReporter.Info("Checking risk tracking")
-	for _, tracking := range model.RiskTracking {
-		foundSome := false
-		var matchingRiskIdExpression = regexp.MustCompile(strings.ReplaceAll(regexp.QuoteMeta(tracking.SyntheticRiskId), `\*`, `[^@]+`))
-		for syntheticRiskId := range model.GeneratedRisksBySyntheticId {
-			if matchingRiskIdExpression.Match([]byte(syntheticRiskId)) {
-				foundSome = true
-			}
-		}
-
-		if !foundSome {
-			if ignoreOrphanedRiskTracking {
-				progressReporter.Infof("Risk tracking references unknown risk (risk id not found): %v", tracking.SyntheticRiskId)
-			} else {
-				return fmt.Errorf("Risk tracking references unknown risk (risk id not found) - you might want to use the option -ignore-orphaned-risk-tracking: %v"+
-					"\n\nNOTE: For risk tracking each risk-id needs to be defined (the string with the @ sign in it). "+
-					"These unique risk IDs are visible in the PDF report (the small grey string under each risk), "+
-					"the Excel (column \"ID\"), as well as the JSON responses. Some risk IDs have only one @ sign in them, "+
-					"while others multiple. The idea is to allow for unique but still speaking IDs. Therefore each risk instance "+
-					"creates its individual ID by taking all affected elements causing the risk to be within an @-delimited part. "+
-					"Using wildcards (the * sign) for parts delimited by @ signs allows to handle groups of certain risks at once. "+
-					"Best is to lookup the IDs to use in the created Excel file. Alternatively a model macro \"seed-risk-tracking\" "+
-					"is available that helps in initially seeding the risk tracking part here based on already identified and not yet handled risks",
-					tracking.SyntheticRiskId)
-			}
-		}
-	}
-
-	return nil
 }
 
 func (model *Model) CheckTagExists(referencedTag, where string) error {
@@ -845,32 +767,25 @@ func (model *Model) GeneratedRisks(what *TechnicalAsset) []*Risk {
 }
 
 func (model *Model) GetRiskTracking(what *Risk) *RiskTracking { // TODO: Unify function naming regarding Get etc.
-	if riskTracking, ok := model.RiskTracking[what.SyntheticId]; ok {
-		return riskTracking
-	}
-	return nil
+	return model.getEffectiveRiskTracking(what.SyntheticId)
 }
 
 func (model *Model) GetRiskTrackingWithDefault(what *Risk) RiskTracking { // TODO: Unify function naming regarding Get etc.
-	if riskTracking, ok := model.RiskTracking[what.SyntheticId]; ok {
+	if riskTracking := model.getEffectiveRiskTracking(what.SyntheticId); riskTracking != nil {
 		return *riskTracking
 	}
 	return RiskTracking{}
 }
 
 func (model *Model) IsRiskTracked(what *Risk) bool {
-	if _, ok := model.RiskTracking[what.SyntheticId]; ok {
-		return true
-	}
-	return false
+	return model.getEffectiveRiskTracking(what.SyntheticId) != nil
 }
 
 func (model *Model) GeneratedRisksByCategoryWithCurrentStatus() map[string][]*Risk {
 	generatedRisksByCategoryWithCurrentStatus := model.GeneratedRisksByCategory
 	for catId, risks := range generatedRisksByCategoryWithCurrentStatus {
 		for idx, risk := range risks {
-			riskTracked, ok := model.RiskTracking[risk.SyntheticId]
-			if ok {
+			if riskTracked := model.getEffectiveRiskTracking(risk.SyntheticId); riskTracked != nil {
 				generatedRisksByCategoryWithCurrentStatus[catId][idx].RiskStatus = riskTracked.Status
 			}
 		}
